@@ -2,7 +2,7 @@ name: Auto Update Spotify Playlists
 
 on:
   schedule:
-    - cron: "0 8 * * *"   # Runs every day at 08:00 UTC
+    - cron: "0 6 * * *"   # Runs every day at 08:00 UTC
   workflow_dispatch:       # Allows you to run it manually
 
 jobs:
