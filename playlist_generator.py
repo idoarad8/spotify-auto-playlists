@@ -27,7 +27,8 @@ PLAYLISTS = {
     "Random Songs (tiny artists)": {"max": 1000, "min": 200},
     "Random Songs (small artists)": {"max": 10000, "min": 1000},
     "Random Songs (medium artists)": {"max": 50000, "min": 10000},
-    "Random Songs (known artists)": {"max": None, "min": 50000},
+    "Random Songs (known artists)": {"max": 500000, "min": 50000},
+    "Random Songs (Famous artists)": {"max": None, "min": 500000},
 }
 
 # =============================
@@ -252,7 +253,7 @@ def main():
     ]
 
     # Run playlists in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
         executor.map(process_playlist, args_list)
 
     print("\nAll playlists updated in parallel!")
@@ -260,6 +261,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
