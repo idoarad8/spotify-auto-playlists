@@ -49,12 +49,18 @@ GLOBAL_SEEDS = [
 # =============================
 # SPOTIFY AUTH
 # =============================
-sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+
+auth = SpotifyOAuth(
     client_id=CLIENT_ID,
     client_secret=CLIENT_SECRET,
     redirect_uri=REDIRECT_URI,
     scope=SCOPE
-))
+)
+
+# Inject refresh token manually
+auth.refresh_token = os.getenv("SPOTIPY_REFRESH_TOKEN")
+
+sp = spotipy.Spotify(auth_manager=auth)
 
 
 # =============================
@@ -253,3 +259,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
