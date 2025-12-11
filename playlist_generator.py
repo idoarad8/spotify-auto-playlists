@@ -5,13 +5,10 @@ import concurrent.futures
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
-# =============================
-# CONFIGURATION
-# =============================
-
 CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI")
+REFRESH_TOKEN = os.getenv("SPOTIPY_REFRESH_TOKEN")
 
 SCOPE = "playlist-modify-private playlist-modify-public playlist-read-private"
 
@@ -57,11 +54,15 @@ auth = SpotifyOAuth(
     scope=SCOPE
 )
 
-# Inject refresh token manually
-auth.refresh_token = os.getenv("SPOTIPY_REFRESH_TOKEN")
+# Inject your refresh token manually
+auth.token_info = {
+    "refresh_token": REFRESH_TOKEN
+}
+
+# Force Spotipy to refresh using the token you provided
+token_info = auth.refresh_access_token(REFRESH_TOKEN)
 
 sp = spotipy.Spotify(auth_manager=auth)
-
 
 # =============================
 # HELPERS
@@ -259,5 +260,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
