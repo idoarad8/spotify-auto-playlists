@@ -27,9 +27,9 @@ FILTER_KARAOKE = True
 # =============================
 PLAYLISTS = {
     "Random Songs A (unknown artists)": {"max": 200, "min": 0},
-    "Random Songs B (tiny artists)": {"max": 1000, "min": 0},
-    "Random Songs C (small artists)": {"max": 10000, "min": 0},
-    "Random Songs D (medium artists)": {"max": 50000, "min": 0},
+    "Random Songs B (tiny artists)": {"max": 1000, "min": 200},
+    "Random Songs C (small artists)": {"max": 10000, "min": 1000},
+    "Random Songs D (medium artists)": {"max": 50000, "min": 10000},
     "Random Songs E (known artists)": {"max": None, "min": 50000},
 }
 
@@ -259,4 +259,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
