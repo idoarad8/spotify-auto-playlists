@@ -27,8 +27,8 @@ PLAYLISTS = {
     "Random Songs (tiny artists)": {"max": 1000, "min": 200},
     "Random Songs (small artists)": {"max": 10000, "min": 1000},
     "Random Songs (medium artists)": {"max": 50000, "min": 10000},
-    "Random Songs (known artists)": {"max": 10000000, "min": 50000},
-    "Random Songs (Famous artists)": {"max": None, "min": 10000000},
+    "Random Songs (known artists)": {"max": 500000, "min": 50000},
+    "Random Songs (Famous artists)": {"max": None, "min": 500000},
 }
 
 # =============================
@@ -261,6 +261,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
