@@ -27,11 +27,29 @@ auth = SpotifyOAuth(
     redirect_uri=REDIRECT_URI,
     scope=SCOPE,
 )
+
 # Inject refresh token and refresh once (non-interactive; works on GitHub Actions)
 auth.token_info = {"refresh_token": REFRESH_TOKEN}
 auth.refresh_access_token(REFRESH_TOKEN)
 
 sp = spotipy.Spotify(auth_manager=auth)
+
+# =========================================================
+# LOGGING
+# =========================================================
+LOG_EVERY_SEC = 10  # print a progress line at least every 10s
+API_CALLS = 0
+
+def log(msg: str):
+    # flush=True is important for GitHub Actions (ensures you see logs live)
+    print(msg, flush=True)
+
+def progress_line(name, heb_cnt, glob_cnt, heb_need, glob_need, api_calls, ind_cnt, max_ind, elapsed):
+    log(
+        f"[{name}] elapsed={elapsed:.0f}s | "
+        f"hebrew={heb_cnt}/{heb_need} global={glob_cnt}/{glob_need} | "
+        f"indian={ind_cnt}/{max_ind} | api_calls={api_calls}"
+    )
 
 # =========================================================
 # USER CONFIG
@@ -60,7 +78,6 @@ MARKET_MAINSTREAM = "US"
 MIN_DELAY_SEC = 0.12  # ~8 requests/sec
 _last_call_ts = 0.0
 
-
 def rate_limit():
     global _last_call_ts
     now = time.time()
@@ -68,7 +85,6 @@ def rate_limit():
     if wait > 0:
         time.sleep(wait)
     _last_call_ts = time.time()
-
 
 # =========================================================
 # PLAYLIST TIERS (followers)
@@ -100,15 +116,14 @@ MAINSTREAM_SEEDS = [
     "a", "e", "i", "o", "u",
     "love", "you", "the", "feat",
     "2024", "2023", "2022",
-    "rem", "ver", "mix"  # still filtered by query and name checks
+    "rem", "ver", "mix"
 ]
 
 # =========================================================
 # DIVERSITY / FILTER HELPERS
 # =========================================================
 def is_hebrew_text(text: str) -> bool:
-    return any("\u0590" <= ch <= "\u05FF" for ch in text)
-
+    return any("\u0590" <= ch <= "\u05FF" for ch in (text or ""))
 
 def is_hebrew_track(track) -> bool:
     if is_hebrew_text(track.get("name", "")):
@@ -121,7 +136,6 @@ def is_hebrew_track(track) -> bool:
             return True
     return False
 
-
 def is_bad_version(name: str) -> bool:
     n = (name or "").lower()
     if FILTER_LIVE and (" live" in n or "(live" in n or "session" in n):
@@ -132,14 +146,12 @@ def is_bad_version(name: str) -> bool:
         return True
     return False
 
-
 # Indian detection (practical heuristic)
 INDIAN_GENRE_KEYWORDS = {
     "bollywood", "desi", "indian", "filmi", "tollywood",
     "punjabi", "bhangra", "tamil", "telugu", "malayalam",
     "kannada", "bengali", "gujarati", "hindi", "urdu"
 }
-
 
 def has_indic_script(text: str) -> bool:
     if not text:
@@ -156,7 +168,6 @@ def has_indic_script(text: str) -> bool:
         for ch in text
     )
 
-
 def is_indian_track(track, artist_obj) -> bool:
     if has_indic_script(track.get("name", "")):
         return True
@@ -168,33 +179,27 @@ def is_indian_track(track, artist_obj) -> bool:
     genres = " ".join(artist_obj.get("genres", [])).lower()
     return any(k in genres for k in INDIAN_GENRE_KEYWORDS)
 
-
 def pick_seed(require_hebrew: bool, mainstream: bool) -> str:
     if require_hebrew:
         return random.choice(HEBREW_SEEDS)
     return random.choice(MAINSTREAM_SEEDS if mainstream else OBSCURE_SEEDS)
 
-
 # =========================================================
 # SPOTIFY API HELPERS (BATCHED)
 # =========================================================
 def batch_search_tracks(seed: str, market: str) -> list:
-    """
-    Fetch up to 50 tracks in one API call.
-    Also remove some unwanted versions at the query level.
-    """
+    """Fetch up to 50 tracks in one API call (with query-level filtering)."""
+    global API_CALLS
     offset = random.randint(0, 900)
     q = f'{seed} -live -karaoke -instrumental -remix'
     rate_limit()
+    API_CALLS += 1
     res = sp.search(q=q, type="track", limit=50, offset=offset, market=market)
     return res.get("tracks", {}).get("items", []) or []
 
-
 def batch_fetch_artist_info(artist_ids: list) -> dict:
-    """
-    Fetch follower counts + genres + names for up to 50 artists in one request.
-    """
-    # de-dupe but keep <= 50
+    """Fetch followers + genres + name for up to 50 artists in one request."""
+    global API_CALLS
     uniq = []
     seen = set()
     for aid in artist_ids:
@@ -205,6 +210,7 @@ def batch_fetch_artist_info(artist_ids: list) -> dict:
             break
 
     rate_limit()
+    API_CALLS += 1
     artists = sp.artists(uniq).get("artists", []) or []
     info = {}
     for a in artists:
@@ -215,36 +221,66 @@ def batch_fetch_artist_info(artist_ids: list) -> dict:
         }
     return info
 
+# =========================================================
+# TRACK GENERATION (with progress logs + rejection stats)
+# =========================================================
+def generate_tracks_for_playlist(max_followers, min_followers, playlist_name=""):
+    start = time.time()
+    last_log = start
 
-# =========================================================
-# TRACK GENERATION
-# =========================================================
-def generate_tracks_for_playlist(max_followers, min_followers):
     hebrew_needed = int(TRACK_COUNT * HEBREW_PERCENT)
     global_needed = TRACK_COUNT - hebrew_needed
 
     hebrew_tracks = []
     global_tracks = []
 
-    # Diversity controls
     artist_counts = {}          # artist_id -> count (max MAX_SONGS_PER_ARTIST)
     seen_uris = set()           # avoid duplicate tracks
     seen_artist_title = set()   # avoid same artist + same title duplicates
 
-    # Indian cap
     max_indian = int(TRACK_COUNT * MAX_INDIAN_PERCENT)
     indian_count = 0
 
-    # Mainstream mode for known/famous tiers
     mainstream_mode = (min_followers is not None and min_followers >= 50000)
     market = MARKET_MAINSTREAM if mainstream_mode else MARKET_DEFAULT
 
-    # For famous tiers, enforce min track popularity
     min_popularity = None
     if mainstream_mode:
-        min_popularity = FAMOUS_MIN_TRACK_POPULARITY if (min_followers and min_followers >= 500000) else KNOWN_MIN_TRACK_POPULARITY
+        min_popularity = (
+            FAMOUS_MIN_TRACK_POPULARITY
+            if (min_followers and min_followers >= 500000)
+            else KNOWN_MIN_TRACK_POPULARITY
+        )
+
+    rejects = {
+        "dup_uri": 0,
+        "dup_title": 0,
+        "artist_cap": 0,
+        "bad_version": 0,
+        "hebrew_quota_full": 0,
+        "global_quota_full": 0,
+        "followers": 0,
+        "popularity": 0,
+        "indian_cap": 0,
+        "missing_data": 0,
+    }
 
     while len(hebrew_tracks) < hebrew_needed or len(global_tracks) < global_needed:
+        now = time.time()
+        if now - last_log >= LOG_EVERY_SEC:
+            elapsed = now - start
+            progress_line(
+                playlist_name,
+                len(hebrew_tracks), len(global_tracks),
+                hebrew_needed, global_needed,
+                API_CALLS,
+                indian_count, max_indian,
+                elapsed
+            )
+            top = sorted(rejects.items(), key=lambda x: x[1], reverse=True)[:3]
+            log(f"[{playlist_name}] top_rejects: " + ", ".join([f"{k}={v}" for k, v in top]))
+            last_log = now
+
         need_hebrew_now = len(hebrew_tracks) < hebrew_needed
         seed = pick_seed(require_hebrew=need_hebrew_now, mainstream=mainstream_mode)
 
@@ -257,63 +293,71 @@ def generate_tracks_for_playlist(max_followers, min_followers):
 
         for track in batch:
             if not track or not track.get("artists"):
+                rejects["missing_data"] += 1
                 continue
 
             uri = track.get("uri")
-            if not uri or uri in seen_uris:
+            if not uri:
+                rejects["missing_data"] += 1
+                continue
+            if uri in seen_uris:
+                rejects["dup_uri"] += 1
                 continue
 
             title = (track.get("name") or "").strip()
-            if not title or is_bad_version(title):
+            if not title:
+                rejects["missing_data"] += 1
+                continue
+            if is_bad_version(title):
+                rejects["bad_version"] += 1
                 continue
 
             artist_id = track["artists"][0].get("id")
             if not artist_id:
+                rejects["missing_data"] += 1
                 continue
 
-            # max 3 songs per artist
-            c = artist_counts.get(artist_id, 0)
-            if c >= MAX_SONGS_PER_ARTIST:
+            if artist_counts.get(artist_id, 0) >= MAX_SONGS_PER_ARTIST:
+                rejects["artist_cap"] += 1
                 continue
 
-            # avoid same artist + same title (common with variants)
             title_key = (artist_id, title.lower())
             if title_key in seen_artist_title:
+                rejects["dup_title"] += 1
                 continue
 
             track_is_hebrew = is_hebrew_track(track)
 
-            # enforce Hebrew/global quotas strictly
-            if track_is_hebrew:
-                if len(hebrew_tracks) >= hebrew_needed:
-                    continue
-            else:
-                if len(global_tracks) >= global_needed:
-                    continue
+            if track_is_hebrew and len(hebrew_tracks) >= hebrew_needed:
+                rejects["hebrew_quota_full"] += 1
+                continue
+            if (not track_is_hebrew) and len(global_tracks) >= global_needed:
+                rejects["global_quota_full"] += 1
+                continue
 
             artist_obj = artist_map.get(artist_id, {"followers": 999999, "genres": [], "name": ""})
             followers = artist_obj["followers"]
 
-            # follower constraints
             if max_followers is not None and followers > max_followers:
+                rejects["followers"] += 1
                 continue
             if min_followers is not None and followers < min_followers:
+                rejects["followers"] += 1
                 continue
 
-            # famous/known tiers: require popular tracks too
-            if min_popularity is not None:
-                if (track.get("popularity") or 0) < min_popularity:
-                    continue
+            if min_popularity is not None and (track.get("popularity") or 0) < min_popularity:
+                rejects["popularity"] += 1
+                continue
 
-            # cap Indian content
             indian_flag = is_indian_track(track, artist_obj)
             if indian_flag and indian_count >= max_indian:
+                rejects["indian_cap"] += 1
                 continue
 
             # ACCEPT
             seen_uris.add(uri)
             seen_artist_title.add(title_key)
-            artist_counts[artist_id] = c + 1
+            artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
             if indian_flag:
                 indian_count += 1
 
@@ -325,40 +369,53 @@ def generate_tracks_for_playlist(max_followers, min_followers):
             if len(hebrew_tracks) >= hebrew_needed and len(global_tracks) >= global_needed:
                 break
 
+    elapsed = time.time() - start
+    log(
+        f"[{playlist_name}] DONE in {elapsed:.1f}s | "
+        f"hebrew={len(hebrew_tracks)} global={len(global_tracks)} | "
+        f"api_calls={API_CALLS}"
+    )
+
     final_tracks = hebrew_tracks + global_tracks
     random.shuffle(final_tracks)
     return final_tracks
-
 
 # =========================================================
 # PLAYLIST MANAGEMENT
 # =========================================================
 def find_or_create_playlist(user_id: str, name: str) -> str:
+    global API_CALLS
     rate_limit()
+    API_CALLS += 1
     playlists = sp.user_playlists(user_id, limit=50)
     for p in playlists.get("items", []) or []:
         if (p.get("name") or "").lower() == name.lower():
             return p["id"]
     rate_limit()
+    API_CALLS += 1
     new_pl = sp.user_playlist_create(user_id, name, public=False)
     return new_pl["id"]
 
-
 def clear_playlist(pid: str):
+    global API_CALLS
     rate_limit()
+    API_CALLS += 1
     sp.playlist_replace_items(pid, [])
 
-
 def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
+    global API_CALLS
     max_f = limits["max"]
     min_f = limits["min"]
+
+    log(f"\n=== START {name} | followers min={min_f} max={max_f} ===")
 
     pid = find_or_create_playlist(user_id, name)
     clear_playlist(pid)
 
-    tracks = generate_tracks_for_playlist(max_f, min_f)
+    tracks = generate_tracks_for_playlist(max_f, min_f, playlist_name=name)
 
     rate_limit()
+    API_CALLS += 1
     sp.playlist_add_items(pid, tracks)
 
     description = (
@@ -372,24 +429,25 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
     )
 
     rate_limit()
+    API_CALLS += 1
     sp.playlist_change_details(pid, description=description)
 
-    print(f"Updated: {name} ({len(tracks)} tracks)")
-
+    log(f"=== END {name} | added={len(tracks)} | total_api_calls={API_CALLS} ===")
 
 # =========================================================
 # MAIN (SEQUENTIAL: avoids rate-limit hangs)
 # =========================================================
 def main():
+    global API_CALLS
     rate_limit()
+    API_CALLS += 1
     user_id = sp.current_user()["id"]
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for name, limits in PLAYLISTS.items():
         process_playlist(user_id, name, limits, timestamp)
 
-    print("\nAll playlists updated!")
-
+    log("\nAll playlists updated!")
 
 if __name__ == "__main__":
     main()
