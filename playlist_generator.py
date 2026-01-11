@@ -31,7 +31,6 @@ auth = SpotifyOAuth(
     scope=SCOPE,
 )
 
-# Non-interactive auth for GitHub Actions
 auth.token_info = {"refresh_token": REFRESH_TOKEN}
 auth.refresh_access_token(REFRESH_TOKEN)
 
@@ -69,12 +68,14 @@ MAX_INDIAN_SMALL_TIERS = 1   # unknown/tiny/small/medium
 MAX_INDIAN_KNOWN = 1
 MAX_INDIAN_FAMOUS = 0
 
-# Track popularity floors for mainstream tiers
 KNOWN_MIN_TRACK_POPULARITY = 45
 FAMOUS_MIN_TRACK_POPULARITY = 70
 
-MARKET_DEFAULT = "IL"
-MARKET_MAINSTREAM = "US"
+# MARKET:
+# - Hebrew search should be IL (more Hebrew content)
+# - Global search should be US (more diverse global results)
+MARKET_HEBREW = "IL"
+MARKET_GLOBAL = "GB"
 
 # Rate limiting (conservative)
 MIN_DELAY_SEC = 0.12
@@ -89,7 +90,6 @@ def rate_limit():
     _last_call_ts = time.time()
 
 def safe_call(fn, *args, **kwargs):
-    """Prevent crashes on intermittent 404/429/5xx. Returns None on error."""
     try:
         return fn(*args, **kwargs)
     except SpotifyException as e:
@@ -107,11 +107,7 @@ PLAYLISTS = {
     "Random Songs (tiny artists)": {"max": 1000, "min": 200},
     "Random Songs (small artists)": {"max": 10000, "min": 1000},
     "Random Songs (medium artists)": {"max": 50000, "min": 10000},
-
-    # Known: do NOT cap, mainstream artists are often >>500k
     "Random Songs (known artists)": {"max": None, "min": 50000},
-
-    # Famous: higher threshold so you actually get famous
     "Random Songs (famous artists)": {"max": None, "min": 2000000},
 }
 
@@ -122,13 +118,10 @@ HEB_LETTERS = list("אבגדהוזחטיכלמנסעפצקרשת")
 HEB_BIGRAMS = ["של", "את", "ים", "אה", "יו", "לי"]
 HEBREW_SEEDS = HEB_LETTERS + HEB_BIGRAMS
 
-# Old gibberish seeds (can bias to specific catalogs)
 OBSCURE_SEEDS_1 = [
     "qz", "zxq", "zzx", "qxx", "zqq", "kjj", "ptk", "xhz",
     "vqx", "zzq", "tzz", "xxa", "mqq", "qvv", "zzp"
 ]
-
-# Added: “semi-random” English words + letter pairs to diversify search space
 OBSCURE_SEEDS_2 = [
     "wx", "qj", "kp", "zr", "vy", "jt", "lz", "qc",
     "midnight", "plastic", "satellite", "neon", "paper",
@@ -142,7 +135,6 @@ MAINSTREAM_SEEDS = [
     "2024", "2023", "2022"
 ]
 
-# Playlist-search keywords for mainstream pool (fallback if no env playlist IDs)
 MAINSTREAM_PLAYLIST_QUERIES = [
     "today's top hits",
     "top hits",
@@ -159,7 +151,7 @@ MAINSTREAM_PLAYLIST_QUERIES = [
 ]
 
 # =========================================================
-# DIVERSITY / FILTER HELPERS
+# FILTER HELPERS
 # =========================================================
 def is_hebrew_text(text: str) -> bool:
     return any("\u0590" <= ch <= "\u05FF" for ch in (text or ""))
@@ -194,7 +186,6 @@ INDIAN_TEXT_KEYWORDS = {
     "bollywood", "t-series", "tseries", "desi", "filmi", "tollywood",
     "punjabi", "bhangra", "hindi", "urdu",
     "tamil", "telugu", "malayalam", "kannada", "bengali", "gujarati",
-    # common high-frequency names that dominate results
     "arijit", "pritam", "shreya", "atif", "rahat", "neha", "badshah"
 }
 
@@ -202,19 +193,18 @@ def has_indic_script(text: str) -> bool:
     if not text:
         return False
     return any(
-        ("\u0900" <= ch <= "\u097F") or  # Devanagari
-        ("\u0980" <= ch <= "\u09FF") or  # Bengali
-        ("\u0A00" <= ch <= "\u0A7F") or  # Gurmukhi
-        ("\u0A80" <= ch <= "\u0AFF") or  # Gujarati
-        ("\u0B80" <= ch <= "\u0BFF") or  # Tamil
-        ("\u0C00" <= ch <= "\u0C7F") or  # Telugu
-        ("\u0C80" <= ch <= "\u0CFF") or  # Kannada
-        ("\u0D00" <= ch <= "\u0D7F")     # Malayalam
+        ("\u0900" <= ch <= "\u097F") or
+        ("\u0980" <= ch <= "\u09FF") or
+        ("\u0A00" <= ch <= "\u0A7F") or
+        ("\u0A80" <= ch <= "\u0AFF") or
+        ("\u0B80" <= ch <= "\u0BFF") or
+        ("\u0C00" <= ch <= "\u0C7F") or
+        ("\u0C80" <= ch <= "\u0CFF") or
+        ("\u0D00" <= ch <= "\u0D7F")
         for ch in text
     )
 
 def is_indian_track(track, artist_obj) -> bool:
-    # Indic scripts
     if has_indic_script(track.get("name", "")):
         return True
     album = track.get("album") or {}
@@ -223,18 +213,13 @@ def is_indian_track(track, artist_obj) -> bool:
     if has_indic_script(artist_obj.get("name", "")):
         return True
 
-    # text keywords
     t = (track.get("name") or "").lower()
     a = (album.get("name") or "").lower()
     an = (artist_obj.get("name") or "").lower()
-    if any(k in t for k in INDIAN_TEXT_KEYWORDS):
-        return True
-    if any(k in a for k in INDIAN_TEXT_KEYWORDS):
-        return True
-    if any(k in an for k in INDIAN_TEXT_KEYWORDS):
-        return True
+    if any(k in t for k in INDIAN_TEXT_KEYWORDS): return True
+    if any(k in a for k in INDIAN_TEXT_KEYWORDS): return True
+    if any(k in an for k in INDIAN_TEXT_KEYWORDS): return True
 
-    # genres
     genres = " ".join(artist_obj.get("genres", [])).lower()
     return any(k in genres for k in INDIAN_GENRE_KEYWORDS)
 
@@ -246,17 +231,13 @@ def pick_seed(require_hebrew: bool, mainstream: bool) -> str:
     return random.choice(OBSCURE_SEEDS_1 + OBSCURE_SEEDS_2)
 
 # =========================================================
-# SPOTIFY API HELPERS (BATCHED)
+# API HELPERS
 # =========================================================
 def batch_search_tracks(seed: str, market: str) -> List[dict]:
-    """Search-based sampler (good for obscure + Hebrew)."""
     global API_CALLS
     offset = random.randint(0, 900)
 
-    # query-level filtering
     q = f'{seed} -live -karaoke -instrumental -remix -edit'
-
-    # stronger negative filters to reduce India-heavy search results
     q += (
         " -bollywood -punjabi -hindi -tamil -telugu -bhangra -desi -filmi"
         " -t-series -tseries -arijit -pritam -shreya -atif -rahat -neha -badshah"
@@ -270,9 +251,7 @@ def batch_search_tracks(seed: str, market: str) -> List[dict]:
     return res.get("tracks", {}).get("items", []) or []
 
 def batch_fetch_artist_info(artist_ids: List[str]) -> Dict[str, dict]:
-    """Fetch followers + genres + name for up to 50 artists in one request."""
     global API_CALLS
-
     uniq = []
     seen = set()
     for aid in artist_ids:
@@ -281,7 +260,6 @@ def batch_fetch_artist_info(artist_ids: List[str]) -> Dict[str, dict]:
             uniq.append(aid)
         if len(uniq) >= 50:
             break
-
     if not uniq:
         return {}
 
@@ -291,9 +269,8 @@ def batch_fetch_artist_info(artist_ids: List[str]) -> Dict[str, dict]:
     if not res:
         return {}
 
-    artists = res.get("artists", []) or []
     info = {}
-    for a in artists:
+    for a in res.get("artists", []) or []:
         info[a["id"]] = {
             "followers": (a.get("followers") or {}).get("total", 999999),
             "genres": a.get("genres", []) or [],
@@ -301,16 +278,7 @@ def batch_fetch_artist_info(artist_ids: List[str]) -> Dict[str, dict]:
         }
     return info
 
-# =========================================================
-# MAINSTREAM PLAYLIST POOL (NO BROWSE ENDPOINTS)
-# =========================================================
 def extract_playlist_id(s: str) -> Optional[str]:
-    """
-    Accepts:
-      - raw playlist ID
-      - https://open.spotify.com/playlist/<id>?si=...
-      - spotify:playlist:<id>
-    """
     if not s:
         return None
     s = s.strip()
@@ -320,15 +288,9 @@ def extract_playlist_id(s: str) -> Optional[str]:
         part = s.split("open.spotify.com/playlist/")[-1]
         part = part.split("?")[0].split("/")[0]
         return part.strip() or None
-    # assume it's already an ID
     return s if len(s) >= 10 else None
 
 def parse_env_playlist_ids() -> List[str]:
-    """
-    Optional: set MAINSTREAM_PLAYLIST_IDS as comma-separated playlist URLs or IDs.
-    Example:
-      MAINSTREAM_PLAYLIST_IDS="https://open.spotify.com/playlist/4IY0u7K6Jj5rPy5pIVCuGp,37i9dQZF1DXcBWIGoYBM5M"
-    """
     raw = (os.getenv("MAINSTREAM_PLAYLIST_IDS") or "").strip()
     if not raw:
         return []
@@ -337,9 +299,7 @@ def parse_env_playlist_ids() -> List[str]:
         pid = extract_playlist_id(part)
         if pid:
             ids.append(pid)
-    # dedup while keeping order
-    out = []
-    seen = set()
+    out, seen = [], set()
     for pid in ids:
         if pid not in seen:
             seen.add(pid)
@@ -347,19 +307,15 @@ def parse_env_playlist_ids() -> List[str]:
     return out
 
 def search_mainstream_playlist_ids(market: str, limit_per_query: int = 10) -> List[str]:
-    """Fallback: find playlist IDs via search."""
     global API_CALLS
-    ids: List[str] = []
-    seen: Set[str] = set()
-
+    ids, seen = [], set()
     for q in MAINSTREAM_PLAYLIST_QUERIES:
         rate_limit()
         API_CALLS += 1
         res = safe_call(sp.search, q=q, type="playlist", limit=limit_per_query, market=market)
         if not res:
             continue
-        items = res.get("playlists", {}).get("items", []) or []
-        for p in items:
+        for p in res.get("playlists", {}).get("items", []) or []:
             pid = (p or {}).get("id")
             if pid and pid not in seen:
                 seen.add(pid)
@@ -373,25 +329,20 @@ def get_mainstream_playlist_pool() -> List[str]:
     if env_ids:
         log(f"[MainstreamPool] Using {len(env_ids)} playlist IDs from MAINSTREAM_PLAYLIST_IDS env.")
         return env_ids
-
-    ids = search_mainstream_playlist_ids(market=MARKET_MAINSTREAM, limit_per_query=10)
+    ids = search_mainstream_playlist_ids(market=MARKET_GLOBAL, limit_per_query=10)
     log(f"[MainstreamPool] Found {len(ids)} playlist IDs via search fallback.")
     return ids
 
 def get_random_tracks_from_playlist(pid: str) -> List[dict]:
-    """Fetch a chunk of tracks from a playlist and return track objects."""
     global API_CALLS
     offset = random.choice([0, 25, 50, 75, 100])
-
     rate_limit()
     API_CALLS += 1
     data = safe_call(sp.playlist_items, pid, limit=50, offset=offset, additional_types=("track",))
     if not data:
         return []
-
-    items = data.get("items", []) or []
     tracks = []
-    for it in items:
+    for it in data.get("items", []) or []:
         t = (it or {}).get("track")
         if t and t.get("uri") and t.get("artists"):
             tracks.append(t)
@@ -419,7 +370,6 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
     mainstream_mode = (min_followers is not None and min_followers >= 50000)
 
-    # popularity floor (only for non-Hebrew)
     min_popularity = None
     if mainstream_mode:
         min_popularity = (
@@ -428,7 +378,6 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
             else KNOWN_MIN_TRACK_POPULARITY
         )
 
-    # Indian caps by tier
     if min_followers is not None and min_followers >= 2000000:
         max_indian = MAX_INDIAN_FAMOUS
     elif mainstream_mode:
@@ -440,20 +389,10 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     mainstream_pool: Optional[List[str]] = None
 
     rejects = {
-        "dup_uri": 0,
-        "dup_title": 0,
-        "artist_cap": 0,
-        "bad_version": 0,
-        "hebrew_quota_full": 0,
-        "global_quota_full": 0,
-        "followers": 0,
-        "popularity": 0,
-        "indian_cap": 0,
-        "missing_data": 0,
-        "timeout": 0,
-        "no_batch": 0,
-        "pool_empty": 0,
-        "batch_india_skip": 0,
+        "dup_uri": 0, "dup_title": 0, "artist_cap": 0, "bad_version": 0,
+        "followers": 0, "popularity": 0, "indian_cap": 0,
+        "missing_data": 0, "timeout": 0, "no_batch": 0,
+        "batch_india_skip": 0, "wrong_bucket": 0
     }
 
     iters = 0
@@ -487,22 +426,20 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
         need_hebrew_now = len(hebrew_tracks) < hebrew_needed
 
-        # Strategy:
-        # - Hebrew: search in IL market
-        # - Known/Famous global: sample from mainstream playlists (env or search)
+        # Fetch batch (IMPORTANT: market differs)
         if mainstream_mode and not need_hebrew_now:
             if mainstream_pool is None:
                 mainstream_pool = get_mainstream_playlist_pool()
-            if not mainstream_pool:
-                rejects["pool_empty"] += 1
-                seed = pick_seed(require_hebrew=False, mainstream=True)
-                batch = batch_search_tracks(seed, market=MARKET_MAINSTREAM)
-            else:
+            if mainstream_pool:
                 pid = random.choice(mainstream_pool)
                 batch = get_random_tracks_from_playlist(pid)
+            else:
+                seed = pick_seed(require_hebrew=False, mainstream=True)
+                batch = batch_search_tracks(seed, market=MARKET_GLOBAL)
         else:
             seed = pick_seed(require_hebrew=need_hebrew_now, mainstream=mainstream_mode)
-            batch = batch_search_tracks(seed, market=MARKET_DEFAULT)
+            market = MARKET_HEBREW if need_hebrew_now else MARKET_GLOBAL
+            batch = batch_search_tracks(seed, market=market)
 
         if not batch:
             rejects["no_batch"] += 1
@@ -511,7 +448,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
         artist_ids = [t["artists"][0]["id"] for t in batch if t and t.get("artists")]
         artist_map = batch_fetch_artist_info(artist_ids)
 
-        # Fast skip India-heavy batches for medium and below (saves time + improves output)
+        # Fast skip India-heavy batches for medium and below
         if not mainstream_mode:
             indian_hits = 0
             checked = 0
@@ -564,29 +501,31 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
             track_is_hebrew = is_hebrew_track(track)
 
-            if track_is_hebrew and len(hebrew_tracks) >= hebrew_needed:
-                rejects["hebrew_quota_full"] += 1
-                continue
-            if (not track_is_hebrew) and len(global_tracks) >= global_needed:
-                rejects["global_quota_full"] += 1
-                continue
+            # HARD RULE to keep the percentage correct:
+            # - Hebrew bucket accepts ONLY Hebrew
+            # - Global bucket accepts ONLY non-Hebrew
+            if need_hebrew_now:
+                if not track_is_hebrew:
+                    rejects["wrong_bucket"] += 1
+                    continue
+            else:
+                if track_is_hebrew:
+                    rejects["wrong_bucket"] += 1
+                    continue
 
             artist_obj = artist_map.get(artist_id, {"followers": 999999, "genres": [], "name": ""})
             followers = artist_obj["followers"]
 
-            # follower constraints:
-            # apply to non-Hebrew in mainstream tiers; always apply in non-mainstream tiers
-            apply_follower_constraints = (not mainstream_mode) or (not track_is_hebrew)
-            if apply_follower_constraints:
-                if max_followers is not None and followers > max_followers:
-                    rejects["followers"] += 1
-                    continue
-                if min_followers is not None and followers < min_followers:
-                    rejects["followers"] += 1
-                    continue
+            # follower constraints
+            if max_followers is not None and followers > max_followers:
+                rejects["followers"] += 1
+                continue
+            if min_followers is not None and followers < min_followers:
+                rejects["followers"] += 1
+                continue
 
-            # popularity floor only for non-Hebrew
-            if (min_popularity is not None) and (not track_is_hebrew) and ((track.get("popularity") or 0) < min_popularity):
+            # popularity floor (only for non-Hebrew, and only for mainstream tiers)
+            if (min_popularity is not None) and ((track.get("popularity") or 0) < min_popularity):
                 rejects["popularity"] += 1
                 continue
 
@@ -665,15 +604,13 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
         return
 
     pid = find_or_create_playlist(user_id, name)
-
-    # Clear only after we have tracks
     clear_playlist(pid)
 
     rate_limit()
     API_CALLS += 1
     res = safe_call(sp.playlist_add_items, pid, tracks)
     if not res:
-        log(f"[WARN] Failed adding tracks to {name} (pid={pid}). Skipping description update.")
+        log(f"[WARN] Failed adding tracks to {name}. Skipping description update.")
         return
 
     description = (
@@ -693,7 +630,7 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
     log(f"=== END {name} | added={len(tracks)} | total_api_calls={API_CALLS} ===")
 
 # =========================================================
-# MAIN (SEQUENTIAL)
+# MAIN
 # =========================================================
 def main():
     global API_CALLS
