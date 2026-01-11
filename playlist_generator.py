@@ -64,8 +64,8 @@ FILTER_KARAOKE = True
 MAX_INDIAN_PERCENT = 0.06  # cap Indian-ish tracks per playlist
 
 # Track popularity floors for mainstream tiers
-KNOWN_MIN_TRACK_POPULARITY = 50
-FAMOUS_MIN_TRACK_POPULARITY = 65
+KNOWN_MIN_TRACK_POPULARITY = 45
+FAMOUS_MIN_TRACK_POPULARITY = 70
 
 MARKET_DEFAULT = "IL"
 MARKET_MAINSTREAM = "US"
@@ -83,15 +83,19 @@ def rate_limit():
     _last_call_ts = time.time()
 
 # =========================================================
-# PLAYLIST TIERS (followers)
+# PLAYLIST TIERS (followers)  ✅ FIXED
 # =========================================================
 PLAYLISTS = {
     "Random Songs (unknown artists)": {"max": 200, "min": 0},
     "Random Songs (tiny artists)": {"max": 1000, "min": 200},
     "Random Songs (small artists)": {"max": 10000, "min": 1000},
     "Random Songs (medium artists)": {"max": 50000, "min": 10000},
-    "Random Songs (known artists)": {"max": 500000, "min": 50000},
-    "Random Songs (famous artists)": {"max": None, "min": 500000},
+
+    # Known: do NOT cap at 500k, mainstream artists are often >>500k
+    "Random Songs (known artists)": {"max": None, "min": 50000},
+
+    # Famous: raise threshold so they are actually very famous
+    "Random Songs (famous artists)": {"max": None, "min": 2000000},
 }
 
 # =========================================================
@@ -106,7 +110,6 @@ OBSCURE_SEEDS = [
     "vqx", "zzq", "tzz", "xxa", "mqq", "qvv", "zzp"
 ]
 
-# IMPORTANT: removed "rem/ver/mix" because it biases to versions/mixes and causes "bad_version" rejects
 MAINSTREAM_SEEDS = [
     "a", "e", "i", "o", "u",
     "love", "you", "the", "feat", "night", "baby", "dance",
@@ -134,7 +137,7 @@ def is_bad_version(name: str) -> bool:
     n = (name or "").lower()
     if FILTER_LIVE and (" live" in n or "(live" in n or "session" in n):
         return True
-    # safer remix detection (avoid false hits)
+    # safer remix detection
     if FILTER_REMIX and (" remix" in n or "(remix" in n or " edit" in n):
         return True
     if FILTER_KARAOKE and ("karaoke" in n or "instrumental" in n):
@@ -169,7 +172,6 @@ def has_indic_script(text: str) -> bool:
     )
 
 def is_indian_track(track, artist_obj) -> bool:
-    # Indic scripts
     if has_indic_script(track.get("name", "")):
         return True
     album = track.get("album") or {}
@@ -178,7 +180,6 @@ def is_indian_track(track, artist_obj) -> bool:
     if has_indic_script(artist_obj.get("name", "")):
         return True
 
-    # text keywords (important when genres missing)
     t = (track.get("name") or "").lower()
     a = (album.get("name") or "").lower()
     an = (artist_obj.get("name") or "").lower()
@@ -189,7 +190,6 @@ def is_indian_track(track, artist_obj) -> bool:
     if any(k in an for k in INDIAN_TEXT_KEYWORDS):
         return True
 
-    # genres
     genres = " ".join(artist_obj.get("genres", [])).lower()
     return any(k in genres for k in INDIAN_GENRE_KEYWORDS)
 
@@ -206,7 +206,6 @@ def batch_search_tracks(seed: str, market: str) -> list:
     global API_CALLS
     offset = random.randint(0, 900)
 
-    # query-level filtering (helps a lot)
     q = f'{seed} -live -karaoke -instrumental -remix -edit'
     q += " -bollywood -punjabi -hindi -tamil -telugu -bhangra -desi -filmi -t-series -tseries"
 
@@ -239,11 +238,8 @@ def batch_fetch_artist_info(artist_ids: list) -> dict:
         }
     return info
 
-# -----------------------------
-# Featured playlists sampler (MAIN FIX for known/famous tiers)
-# -----------------------------
-def get_featured_playlist_ids(limit=20, market=MARKET_MAINSTREAM):
-    """Return playlist IDs from Spotify featured playlists (mainstream)."""
+# Featured playlists sampler (main fix for known/famous)
+def get_featured_playlist_ids(limit=30, market=MARKET_MAINSTREAM):
     global API_CALLS
     rate_limit()
     API_CALLS += 1
@@ -251,11 +247,10 @@ def get_featured_playlist_ids(limit=20, market=MARKET_MAINSTREAM):
     items = (data.get("playlists") or {}).get("items", []) or []
     return [p["id"] for p in items if p and p.get("id")]
 
-def get_random_tracks_from_playlist(pid, max_items=100):
-    """Fetch a chunk of tracks from a playlist and return track objects."""
+def get_random_tracks_from_playlist(pid):
     global API_CALLS
-    # Pull 50 at random offset (best-effort; playlist length varies)
-    offset = random.randint(0, 50)  # simple; avoids needing playlist length calls
+    # No need to know playlist length; just sample a few offsets
+    offset = random.choice([0, 25, 50, 75, 100])
     rate_limit()
     API_CALLS += 1
     data = sp.playlist_items(pid, limit=50, offset=offset, additional_types=("track",))
@@ -274,8 +269,8 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     start = time.time()
     last_log = start
 
-    HARD_TIMEOUT_SEC = 240   # give mainstream tiers more time
-    MAX_TOTAL_ITERATIONS = 3500
+    HARD_TIMEOUT_SEC = 240
+    MAX_TOTAL_ITERATIONS = 4000
 
     hebrew_needed = int(TRACK_COUNT * HEBREW_PERCENT)
     global_needed = TRACK_COUNT - hebrew_needed
@@ -289,26 +284,24 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
     mainstream_mode = (min_followers is not None and min_followers >= 50000)
 
-    # Popularity floor for known/famous tiers
     min_popularity = None
     if mainstream_mode:
         min_popularity = (
             FAMOUS_MIN_TRACK_POPULARITY
-            if (min_followers and min_followers >= 500000)
+            if (min_followers and min_followers >= 2000000)
             else KNOWN_MIN_TRACK_POPULARITY
         )
 
-    # Indian cap: stricter for known/famous
-    if min_followers is not None and min_followers >= 500000:
+    # Indian cap: strict for famous, small for known
+    if min_followers is not None and min_followers >= 2000000:
         max_indian = 0
-    elif min_followers is not None and min_followers >= 50000:
+    elif mainstream_mode:
         max_indian = 1
     else:
         max_indian = int(TRACK_COUNT * MAX_INDIAN_PERCENT)
 
     indian_count = 0
 
-    # cache featured playlists for this run (avoid repeated calls)
     featured_ids = None
 
     rejects = {
@@ -349,11 +342,8 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
         need_hebrew_now = len(hebrew_tracks) < hebrew_needed
 
-        # ------------------------------------------------------
-        # MAIN FIX:
-        # For known/famous GLOBAL portion: sample from featured playlists
+        # For known/famous GLOBAL portion, sample from featured playlists (US market).
         # Hebrew portion always uses search in IL market.
-        # ------------------------------------------------------
         if mainstream_mode and not need_hebrew_now:
             if featured_ids is None:
                 featured_ids = get_featured_playlist_ids(limit=30, market=MARKET_MAINSTREAM)
@@ -361,11 +351,10 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                 rejects["no_batch"] += 1
                 continue
             pid = random.choice(featured_ids)
-            batch = get_random_tracks_from_playlist(pid, max_items=200)
+            batch = get_random_tracks_from_playlist(pid)
         else:
             seed = pick_seed(require_hebrew=need_hebrew_now, mainstream=mainstream_mode)
-            market = MARKET_DEFAULT  # always IL for search sampling (better for Hebrew + diversity)
-            batch = batch_search_tracks(seed, market=market)
+            batch = batch_search_tracks(seed, market=MARKET_DEFAULT)
 
         if not batch:
             rejects["no_batch"] += 1
@@ -421,7 +410,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
             artist_obj = artist_map.get(artist_id, {"followers": 999999, "genres": [], "name": ""})
             followers = artist_obj["followers"]
 
-            # KEY FIX: For known/famous tiers, apply follower limits ONLY to non-Hebrew tracks
+            # In known/famous tiers, apply follower limits ONLY to non-Hebrew tracks
             apply_follower_constraints = (not mainstream_mode) or (not track_is_hebrew)
 
             if apply_follower_constraints:
@@ -432,7 +421,8 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                     rejects["followers"] += 1
                     continue
 
-            if min_popularity is not None and (track.get("popularity") or 0) < min_popularity:
+            # Popularity floor only for non-Hebrew (prevents starving Hebrew quota)
+            if (min_popularity is not None) and (not track_is_hebrew) and ((track.get("popularity") or 0) < min_popularity):
                 rejects["popularity"] += 1
                 continue
 
