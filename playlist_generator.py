@@ -2,8 +2,11 @@ import os
 import random
 import datetime
 import time
+from typing import List, Dict, Optional, Set, Tuple
+
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.exceptions import SpotifyException
 
 # =========================================================
 # ENV / AUTH
@@ -70,7 +73,7 @@ FAMOUS_MIN_TRACK_POPULARITY = 70
 MARKET_DEFAULT = "IL"
 MARKET_MAINSTREAM = "US"
 
-# Rate limiting
+# Rate limiting (conservative)
 MIN_DELAY_SEC = 0.12
 _last_call_ts = 0.0
 
@@ -82,8 +85,23 @@ def rate_limit():
         time.sleep(wait)
     _last_call_ts = time.time()
 
+def safe_call(fn, *args, **kwargs):
+    """
+    Wrapper to prevent hard-crashes on intermittent 404/429/etc.
+    Returns None on error.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except SpotifyException as e:
+        # common: 404, 429, 503, etc
+        log(f"[WARN] SpotifyException {e.http_status}: {e}")
+        return None
+    except Exception as e:
+        log(f"[WARN] Unexpected exception: {e}")
+        return None
+
 # =========================================================
-# PLAYLIST TIERS (followers)  ✅ FIXED
+# PLAYLIST TIERS (followers)
 # =========================================================
 PLAYLISTS = {
     "Random Songs (unknown artists)": {"max": 200, "min": 0},
@@ -91,10 +109,10 @@ PLAYLISTS = {
     "Random Songs (small artists)": {"max": 10000, "min": 1000},
     "Random Songs (medium artists)": {"max": 50000, "min": 10000},
 
-    # Known: do NOT cap at 500k, mainstream artists are often >>500k
+    # Known: mainstream artists are often >>500k, don't cap
     "Random Songs (known artists)": {"max": None, "min": 50000},
 
-    # Famous: raise threshold so they are actually very famous
+    # Famous: raise threshold so it's actually famous
     "Random Songs (famous artists)": {"max": None, "min": 2000000},
 }
 
@@ -116,8 +134,24 @@ MAINSTREAM_SEEDS = [
     "2024", "2023", "2022"
 ]
 
+# Playlist-search keywords for mainstream pool (fallback if no env playlist IDs)
+MAINSTREAM_PLAYLIST_QUERIES = [
+    "today's top hits",
+    "top hits",
+    "viral hits",
+    "pop rising",
+    "mint",
+    "rap caviar",
+    "rock classics",
+    "all out 00s",
+    "songs to sing in the car",
+    "hot hits",
+    "global top 50",
+    "new music friday",
+]
+
 # =========================================================
-# HELPERS
+# DIVERSITY / FILTER HELPERS
 # =========================================================
 def is_hebrew_text(text: str) -> bool:
     return any("\u0590" <= ch <= "\u05FF" for ch in (text or ""))
@@ -149,7 +183,6 @@ INDIAN_GENRE_KEYWORDS = {
     "punjabi", "bhangra", "tamil", "telugu", "malayalam",
     "kannada", "bengali", "gujarati", "hindi", "urdu"
 }
-
 INDIAN_TEXT_KEYWORDS = {
     "bollywood", "t-series", "tseries", "desi", "filmi", "tollywood",
     "punjabi", "bhangra", "hindi", "urdu",
@@ -199,9 +232,9 @@ def pick_seed(require_hebrew: bool, mainstream: bool) -> str:
     return random.choice(MAINSTREAM_SEEDS if mainstream else OBSCURE_SEEDS)
 
 # =========================================================
-# SPOTIFY API HELPERS
+# SPOTIFY API HELPERS (BATCHED)
 # =========================================================
-def batch_search_tracks(seed: str, market: str) -> list:
+def batch_search_tracks(seed: str, market: str) -> List[dict]:
     """Search-based sampler (good for obscure + Hebrew)."""
     global API_CALLS
     offset = random.randint(0, 900)
@@ -211,10 +244,12 @@ def batch_search_tracks(seed: str, market: str) -> list:
 
     rate_limit()
     API_CALLS += 1
-    res = sp.search(q=q, type="track", limit=50, offset=offset, market=market)
+    res = safe_call(sp.search, q=q, type="track", limit=50, offset=offset, market=market)
+    if not res:
+        return []
     return res.get("tracks", {}).get("items", []) or []
 
-def batch_fetch_artist_info(artist_ids: list) -> dict:
+def batch_fetch_artist_info(artist_ids: List[str]) -> Dict[str, dict]:
     """Fetch followers + genres + name for up to 50 artists in one request."""
     global API_CALLS
     uniq = []
@@ -226,9 +261,16 @@ def batch_fetch_artist_info(artist_ids: list) -> dict:
         if len(uniq) >= 50:
             break
 
+    if not uniq:
+        return {}
+
     rate_limit()
     API_CALLS += 1
-    artists = sp.artists(uniq).get("artists", []) or []
+    res = safe_call(sp.artists, uniq)
+    if not res:
+        return {}
+
+    artists = res.get("artists", []) or []
     info = {}
     for a in artists:
         info[a["id"]] = {
@@ -238,22 +280,72 @@ def batch_fetch_artist_info(artist_ids: list) -> dict:
         }
     return info
 
-# Featured playlists sampler (main fix for known/famous)
-def get_featured_playlist_ids(limit=30, market=MARKET_MAINSTREAM):
-    global API_CALLS
-    rate_limit()
-    API_CALLS += 1
-    data = sp.featured_playlists(country=market, limit=limit)
-    items = (data.get("playlists") or {}).get("items", []) or []
-    return [p["id"] for p in items if p and p.get("id")]
+# =========================================================
+# MAINSTREAM PLAYLIST POOL (NO BROWSE ENDPOINTS)
+# =========================================================
+def parse_env_playlist_ids() -> List[str]:
+    """
+    Optional: set MAINSTREAM_PLAYLIST_IDS as comma-separated playlist IDs.
+    Example: "37i9dQZF1DXcBWIGoYBM5M,37i9dQZF1DX0XUsuxWHRQd"
+    """
+    raw = (os.getenv("MAINSTREAM_PLAYLIST_IDS") or "").strip()
+    if not raw:
+        return []
+    ids = []
+    for part in raw.split(","):
+        pid = part.strip()
+        if pid:
+            ids.append(pid)
+    return ids
 
-def get_random_tracks_from_playlist(pid):
+def search_mainstream_playlist_ids(market: str, limit_per_query: int = 10) -> List[str]:
+    """Fallback: find playlist IDs via search (not Browse/Featured)."""
     global API_CALLS
-    # No need to know playlist length; just sample a few offsets
+    ids: List[str] = []
+    seen: Set[str] = set()
+
+    for q in MAINSTREAM_PLAYLIST_QUERIES:
+        rate_limit()
+        API_CALLS += 1
+        res = safe_call(sp.search, q=q, type="playlist", limit=limit_per_query, market=market)
+        if not res:
+            continue
+        items = res.get("playlists", {}).get("items", []) or []
+        for p in items:
+            pid = (p or {}).get("id")
+            if pid and pid not in seen:
+                seen.add(pid)
+                ids.append(pid)
+        if len(ids) >= 50:
+            break
+    return ids
+
+def get_mainstream_playlist_pool() -> List[str]:
+    """
+    Priority:
+    1) MAINSTREAM_PLAYLIST_IDS env var
+    2) search playlists
+    """
+    env_ids = parse_env_playlist_ids()
+    if env_ids:
+        log(f"[MainstreamPool] Using {len(env_ids)} playlist IDs from MAINSTREAM_PLAYLIST_IDS env.")
+        return env_ids
+
+    ids = search_mainstream_playlist_ids(market=MARKET_MAINSTREAM, limit_per_query=10)
+    log(f"[MainstreamPool] Found {len(ids)} playlist IDs via search fallback.")
+    return ids
+
+def get_random_tracks_from_playlist(pid: str) -> List[dict]:
+    """Fetch a chunk of tracks from a playlist and return track objects."""
+    global API_CALLS
     offset = random.choice([0, 25, 50, 75, 100])
+
     rate_limit()
     API_CALLS += 1
-    data = sp.playlist_items(pid, limit=50, offset=offset, additional_types=("track",))
+    data = safe_call(sp.playlist_items, pid, limit=50, offset=offset, additional_types=("track",))
+    if not data:
+        return []
+
     items = data.get("items", []) or []
     tracks = []
     for it in items:
@@ -270,17 +362,17 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     last_log = start
 
     HARD_TIMEOUT_SEC = 240
-    MAX_TOTAL_ITERATIONS = 4000
+    MAX_TOTAL_ITERATIONS = 4500
 
     hebrew_needed = int(TRACK_COUNT * HEBREW_PERCENT)
     global_needed = TRACK_COUNT - hebrew_needed
 
-    hebrew_tracks = []
-    global_tracks = []
+    hebrew_tracks: List[str] = []
+    global_tracks: List[str] = []
 
-    artist_counts = {}
-    seen_uris = set()
-    seen_artist_title = set()
+    artist_counts: Dict[str, int] = {}
+    seen_uris: Set[str] = set()
+    seen_artist_title: Set[Tuple[str, str]] = set()
 
     mainstream_mode = (min_followers is not None and min_followers >= 50000)
 
@@ -302,13 +394,22 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
     indian_count = 0
 
-    featured_ids = None
+    mainstream_pool: Optional[List[str]] = None
 
     rejects = {
-        "dup_uri": 0, "dup_title": 0, "artist_cap": 0, "bad_version": 0,
-        "hebrew_quota_full": 0, "global_quota_full": 0, "followers": 0,
-        "popularity": 0, "indian_cap": 0, "missing_data": 0, "timeout": 0,
-        "no_batch": 0
+        "dup_uri": 0,
+        "dup_title": 0,
+        "artist_cap": 0,
+        "bad_version": 0,
+        "hebrew_quota_full": 0,
+        "global_quota_full": 0,
+        "followers": 0,
+        "popularity": 0,
+        "indian_cap": 0,
+        "missing_data": 0,
+        "timeout": 0,
+        "no_batch": 0,
+        "pool_empty": 0,
     }
 
     iters = 0
@@ -342,16 +443,22 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
         need_hebrew_now = len(hebrew_tracks) < hebrew_needed
 
-        # For known/famous GLOBAL portion, sample from featured playlists (US market).
-        # Hebrew portion always uses search in IL market.
+        # ------------------------------------------------------
+        # Strategy:
+        # - Hebrew: search in IL market
+        # - Known/Famous global: sample from mainstream playlists (from env or search)
+        # ------------------------------------------------------
         if mainstream_mode and not need_hebrew_now:
-            if featured_ids is None:
-                featured_ids = get_featured_playlist_ids(limit=30, market=MARKET_MAINSTREAM)
-            if not featured_ids:
-                rejects["no_batch"] += 1
-                continue
-            pid = random.choice(featured_ids)
-            batch = get_random_tracks_from_playlist(pid)
+            if mainstream_pool is None:
+                mainstream_pool = get_mainstream_playlist_pool()
+            if not mainstream_pool:
+                rejects["pool_empty"] += 1
+                # fallback: search tracks instead of playlists
+                seed = pick_seed(require_hebrew=False, mainstream=True)
+                batch = batch_search_tracks(seed, market=MARKET_MAINSTREAM)
+            else:
+                pid = random.choice(mainstream_pool)
+                batch = get_random_tracks_from_playlist(pid)
         else:
             seed = pick_seed(require_hebrew=need_hebrew_now, mainstream=mainstream_mode)
             batch = batch_search_tracks(seed, market=MARKET_DEFAULT)
@@ -410,7 +517,8 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
             artist_obj = artist_map.get(artist_id, {"followers": 999999, "genres": [], "name": ""})
             followers = artist_obj["followers"]
 
-            # In known/famous tiers, apply follower limits ONLY to non-Hebrew tracks
+            # follower constraints:
+            # apply to non-Hebrew in mainstream tiers; always apply in non-mainstream tiers
             apply_follower_constraints = (not mainstream_mode) or (not track_is_hebrew)
 
             if apply_follower_constraints:
@@ -421,7 +529,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                     rejects["followers"] += 1
                     continue
 
-            # Popularity floor only for non-Hebrew (prevents starving Hebrew quota)
+            # popularity floor only for non-Hebrew
             if (min_popularity is not None) and (not track_is_hebrew) and ((track.get("popularity") or 0) < min_popularity):
                 rejects["popularity"] += 1
                 continue
@@ -468,20 +576,24 @@ def find_or_create_playlist(user_id: str, name: str) -> str:
     global API_CALLS
     rate_limit()
     API_CALLS += 1
-    playlists = sp.user_playlists(user_id, limit=50)
-    for p in playlists.get("items", []) or []:
-        if (p.get("name") or "").lower() == name.lower():
-            return p["id"]
+    playlists = safe_call(sp.user_playlists, user_id, limit=50)
+    if playlists:
+        for p in playlists.get("items", []) or []:
+            if (p.get("name") or "").lower() == name.lower():
+                return p["id"]
+
     rate_limit()
     API_CALLS += 1
-    new_pl = sp.user_playlist_create(user_id, name, public=False)
+    new_pl = safe_call(sp.user_playlist_create, user_id, name, public=False)
+    if not new_pl or not new_pl.get("id"):
+        raise RuntimeError(f"Failed to create playlist: {name}")
     return new_pl["id"]
 
 def clear_playlist(pid: str):
     global API_CALLS
     rate_limit()
     API_CALLS += 1
-    sp.playlist_replace_items(pid, [])
+    safe_call(sp.playlist_replace_items, pid, [])
 
 def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
     global API_CALLS
@@ -490,7 +602,6 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
 
     log(f"\n=== START {name} | followers min={min_f} max={max_f} ===")
 
-    # Generate first. If generation fails, do NOT clear playlist.
     tracks = generate_tracks_for_playlist(max_f, min_f, playlist_name=name)
 
     if not tracks:
@@ -499,12 +610,15 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
 
     pid = find_or_create_playlist(user_id, name)
 
-    # Clear only after we have something to replace with
+    # Clear only after we have tracks
     clear_playlist(pid)
 
     rate_limit()
     API_CALLS += 1
-    sp.playlist_add_items(pid, tracks)
+    res = safe_call(sp.playlist_add_items, pid, tracks)
+    if not res:
+        log(f"[WARN] Failed adding tracks to {name} (pid={pid}). Skipping description update.")
+        return
 
     description = (
         f"Auto-updated at {timestamp}. "
@@ -518,7 +632,7 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
 
     rate_limit()
     API_CALLS += 1
-    sp.playlist_change_details(pid, description=description)
+    safe_call(sp.playlist_change_details, pid, description=description)
 
     log(f"=== END {name} | added={len(tracks)} | total_api_calls={API_CALLS} ===")
 
@@ -529,7 +643,11 @@ def main():
     global API_CALLS
     rate_limit()
     API_CALLS += 1
-    user_id = sp.current_user()["id"]
+    me = safe_call(sp.current_user)
+    if not me or not me.get("id"):
+        raise RuntimeError("Failed to read current user. Check token/scopes.")
+    user_id = me["id"]
+
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for name, limits in PLAYLISTS.items():
