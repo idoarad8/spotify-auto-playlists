@@ -34,7 +34,6 @@ auth = SpotifyOAuth(
 # Non-interactive auth (GitHub Actions)
 auth.token_info = {"refresh_token": REFRESH_TOKEN}
 auth.refresh_access_token(REFRESH_TOKEN)
-
 sp = spotipy.Spotify(auth_manager=auth)
 
 # =========================================================
@@ -69,7 +68,7 @@ MAX_INDIAN_SMALL_TIERS = 1   # unknown/tiny/small/medium
 MAX_INDIAN_KNOWN = 1
 MAX_INDIAN_FAMOUS = 0
 
-# Track popularity floors for mainstream tiers
+# Track popularity floors for mainstream tiers (global bucket only)
 KNOWN_MIN_TRACK_POPULARITY = 45
 FAMOUS_MIN_TRACK_POPULARITY = 70
 
@@ -121,6 +120,8 @@ PLAYLISTS = {
     "Random Songs (tiny artists)": {"max": 1000, "min": 200},
     "Random Songs (small artists)": {"max": 10000, "min": 1000},
     "Random Songs (medium artists)": {"max": 50000, "min": 10000},
+
+    # Mainstream tiers:
     "Random Songs (known artists)": {"max": None, "min": 50000},
     "Random Songs (famous artists)": {"max": None, "min": 2000000},
 }
@@ -370,7 +371,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     last_log = start
 
     HARD_TIMEOUT_SEC = 240
-    MAX_TOTAL_ITERATIONS = 5000
+    MAX_TOTAL_ITERATIONS = 6000
 
     hebrew_needed = int(TRACK_COUNT * HEBREW_PERCENT)
     global_needed = TRACK_COUNT - hebrew_needed
@@ -382,11 +383,12 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     seen_uris: Set[str] = set()
     seen_artist_title: Set[Tuple[str, str]] = set()
 
-    # NEW: word frequency guard for small tiers
+    # word frequency guard for small tiers (global bucket)
     title_word_counts: Dict[str, int] = {}
 
     mainstream_mode = (min_followers is not None and min_followers >= 50000)
 
+    # popularity floor for mainstream tiers (global bucket only)
     min_popularity = None
     if mainstream_mode:
         min_popularity = (
@@ -395,6 +397,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
             else KNOWN_MIN_TRACK_POPULARITY
         )
 
+    # indian caps
     if min_followers is not None and min_followers >= 2000000:
         max_indian = MAX_INDIAN_FAMOUS
     elif mainstream_mode:
@@ -444,7 +447,9 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
         need_hebrew_now = len(hebrew_tracks) < hebrew_needed
 
-        # Fetch batch (market differs)
+        # Fetch batch:
+        # - Known/Famous global bucket: sample from mainstream playlists (better than search)
+        # - Hebrew bucket: search in IL
         if mainstream_mode and not need_hebrew_now:
             if mainstream_pool is None:
                 mainstream_pool = get_mainstream_playlist_pool()
@@ -519,7 +524,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
             track_is_hebrew = is_hebrew_track(track)
 
-            # Enforce bucket purity to keep % correct
+            # Enforce bucket purity to keep % correct:
             if need_hebrew_now:
                 if not track_is_hebrew:
                     rejects["wrong_bucket"] += 1
@@ -539,16 +544,23 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
             artist_obj = artist_map.get(artist_id, {"followers": 999999, "genres": [], "name": ""})
             followers = artist_obj["followers"]
 
-            if max_followers is not None and followers > max_followers:
-                rejects["followers"] += 1
-                continue
-            if min_followers is not None and followers < min_followers:
-                rejects["followers"] += 1
-                continue
+            # =====================================================
+            # IMPORTANT FIX:
+            # For mainstream tiers (known/famous), DO NOT apply follower/popularity constraints to Hebrew bucket.
+            # Apply them only to the global bucket.
+            # =====================================================
+            apply_constraints = (not mainstream_mode) or (not track_is_hebrew)
 
-            if (min_popularity is not None) and ((track.get("popularity") or 0) < min_popularity):
-                rejects["popularity"] += 1
-                continue
+            if apply_constraints:
+                if max_followers is not None and followers > max_followers:
+                    rejects["followers"] += 1
+                    continue
+                if min_followers is not None and followers < min_followers:
+                    rejects["followers"] += 1
+                    continue
+                if (min_popularity is not None) and ((track.get("popularity") or 0) < min_popularity):
+                    rejects["popularity"] += 1
+                    continue
 
             indian_flag = is_indian_track(track, artist_obj)
             if indian_flag and indian_count >= max_indian:
