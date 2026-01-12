@@ -2,6 +2,7 @@ import os
 import random
 import datetime
 import time
+import re
 from typing import List, Dict, Optional, Set, Tuple
 
 import spotipy
@@ -30,7 +31,7 @@ auth = SpotifyOAuth(
     redirect_uri=REDIRECT_URI,
     scope=SCOPE,
 )
-
+# Non-interactive auth (GitHub Actions)
 auth.token_info = {"refresh_token": REFRESH_TOKEN}
 auth.refresh_access_token(REFRESH_TOKEN)
 
@@ -68,18 +69,30 @@ MAX_INDIAN_SMALL_TIERS = 1   # unknown/tiny/small/medium
 MAX_INDIAN_KNOWN = 1
 MAX_INDIAN_FAMOUS = 0
 
+# Track popularity floors for mainstream tiers
 KNOWN_MIN_TRACK_POPULARITY = 45
 FAMOUS_MIN_TRACK_POPULARITY = 70
 
-# MARKET:
-# - Hebrew search should be IL (more Hebrew content)
-# - Global search should be US (more diverse global results)
+# Market control:
+# - Hebrew search uses IL
+# - Global search uses US for diversity
 MARKET_HEBREW = "IL"
-MARKET_GLOBAL = "GB"
+MARKET_GLOBAL = "US"
 
 # Rate limiting (conservative)
 MIN_DELAY_SEC = 0.12
 _last_call_ts = 0.0
+
+# Word repetition limiter (prevents "one word everywhere" in small tiers)
+MAX_TITLE_WORD_REPEAT = 3
+MIN_WORD_LEN = 4
+STOPWORDS = {
+    "the", "and", "feat", "with", "from", "this", "that", "your", "mine",
+    "live", "remix", "edit", "radio", "version", "mix", "karaoke",
+    "instrumental", "session", "acoustic", "mono", "stereo"
+}
+
+_WORD_RE = re.compile(r"[a-zA-Z0-9]+")
 
 def rate_limit():
     global _last_call_ts
@@ -90,6 +103,7 @@ def rate_limit():
     _last_call_ts = time.time()
 
 def safe_call(fn, *args, **kwargs):
+    """Prevent crashes on intermittent 404/429/5xx; returns None on error."""
     try:
         return fn(*args, **kwargs)
     except SpotifyException as e:
@@ -118,15 +132,11 @@ HEB_LETTERS = list("אבגדהוזחטיכלמנסעפצקרשת")
 HEB_BIGRAMS = ["של", "את", "ים", "אה", "יו", "לי"]
 HEBREW_SEEDS = HEB_LETTERS + HEB_BIGRAMS
 
-OBSCURE_SEEDS_1 = [
+# For small tiers prefer letter-pairs / gibberish (less word-bias)
+OBSCURE_SEEDS = [
     "qz", "zxq", "zzx", "qxx", "zqq", "kjj", "ptk", "xhz",
-    "vqx", "zzq", "tzz", "xxa", "mqq", "qvv", "zzp"
-]
-OBSCURE_SEEDS_2 = [
-    "wx", "qj", "kp", "zr", "vy", "jt", "lz", "qc",
-    "midnight", "plastic", "satellite", "neon", "paper",
-    "echo", "hollow", "canyon", "dust", "mirror", "violet",
-    "wander", "signal", "orbit", "feather", "cinema"
+    "vqx", "zzq", "tzz", "xxa", "mqq", "qvv", "zzp",
+    "wx", "qj", "kp", "zr", "vy", "jt", "lz", "qc"
 ]
 
 MAINSTREAM_SEEDS = [
@@ -228,7 +238,12 @@ def pick_seed(require_hebrew: bool, mainstream: bool) -> str:
         return random.choice(HEBREW_SEEDS)
     if mainstream:
         return random.choice(MAINSTREAM_SEEDS)
-    return random.choice(OBSCURE_SEEDS_1 + OBSCURE_SEEDS_2)
+    return random.choice(OBSCURE_SEEDS)
+
+def title_words(title: str) -> List[str]:
+    t = (title or "").lower()
+    words = [w for w in _WORD_RE.findall(t)]
+    return [w for w in words if len(w) >= MIN_WORD_LEN and w not in STOPWORDS]
 
 # =========================================================
 # API HELPERS
@@ -236,13 +251,12 @@ def pick_seed(require_hebrew: bool, mainstream: bool) -> str:
 def batch_search_tracks(seed: str, market: str) -> List[dict]:
     global API_CALLS
     offset = random.randint(0, 900)
-
     q = f'{seed} -live -karaoke -instrumental -remix -edit'
+    # stronger negative filters
     q += (
         " -bollywood -punjabi -hindi -tamil -telugu -bhangra -desi -filmi"
         " -t-series -tseries -arijit -pritam -shreya -atif -rahat -neha -badshah"
     )
-
     rate_limit()
     API_CALLS += 1
     res = safe_call(sp.search, q=q, type="track", limit=50, offset=offset, market=market)
@@ -356,7 +370,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     last_log = start
 
     HARD_TIMEOUT_SEC = 240
-    MAX_TOTAL_ITERATIONS = 4500
+    MAX_TOTAL_ITERATIONS = 5000
 
     hebrew_needed = int(TRACK_COUNT * HEBREW_PERCENT)
     global_needed = TRACK_COUNT - hebrew_needed
@@ -367,6 +381,9 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
     artist_counts: Dict[str, int] = {}
     seen_uris: Set[str] = set()
     seen_artist_title: Set[Tuple[str, str]] = set()
+
+    # NEW: word frequency guard for small tiers
+    title_word_counts: Dict[str, int] = {}
 
     mainstream_mode = (min_followers is not None and min_followers >= 50000)
 
@@ -392,7 +409,8 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
         "dup_uri": 0, "dup_title": 0, "artist_cap": 0, "bad_version": 0,
         "followers": 0, "popularity": 0, "indian_cap": 0,
         "missing_data": 0, "timeout": 0, "no_batch": 0,
-        "batch_india_skip": 0, "wrong_bucket": 0
+        "batch_india_skip": 0, "wrong_bucket": 0,
+        "word_repeat": 0
     }
 
     iters = 0
@@ -420,13 +438,13 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                 indian_count, max_indian,
                 elapsed
             )
-            top = sorted(rejects.items(), key=lambda x: x[1], reverse=True)[:5]
+            top = sorted(rejects.items(), key=lambda x: x[1], reverse=True)[:6]
             log(f"[{playlist_name}] top_rejects: " + ", ".join([f"{k}={v}" for k, v in top]))
             last_log = now
 
         need_hebrew_now = len(hebrew_tracks) < hebrew_needed
 
-        # Fetch batch (IMPORTANT: market differs)
+        # Fetch batch (market differs)
         if mainstream_mode and not need_hebrew_now:
             if mainstream_pool is None:
                 mainstream_pool = get_mainstream_playlist_pool()
@@ -448,7 +466,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
         artist_ids = [t["artists"][0]["id"] for t in batch if t and t.get("artists")]
         artist_map = batch_fetch_artist_info(artist_ids)
 
-        # Fast skip India-heavy batches for medium and below
+        # Fast skip India-heavy batches for small tiers
         if not mainstream_mode:
             indian_hits = 0
             checked = 0
@@ -501,9 +519,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
 
             track_is_hebrew = is_hebrew_track(track)
 
-            # HARD RULE to keep the percentage correct:
-            # - Hebrew bucket accepts ONLY Hebrew
-            # - Global bucket accepts ONLY non-Hebrew
+            # Enforce bucket purity to keep % correct
             if need_hebrew_now:
                 if not track_is_hebrew:
                     rejects["wrong_bucket"] += 1
@@ -513,10 +529,16 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                     rejects["wrong_bucket"] += 1
                     continue
 
+            # Word repeat limiter only for small tiers and global bucket
+            if (not mainstream_mode) and (not need_hebrew_now):
+                wlist = title_words(title)
+                if any(title_word_counts.get(w, 0) >= MAX_TITLE_WORD_REPEAT for w in wlist):
+                    rejects["word_repeat"] += 1
+                    continue
+
             artist_obj = artist_map.get(artist_id, {"followers": 999999, "genres": [], "name": ""})
             followers = artist_obj["followers"]
 
-            # follower constraints
             if max_followers is not None and followers > max_followers:
                 rejects["followers"] += 1
                 continue
@@ -524,7 +546,6 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                 rejects["followers"] += 1
                 continue
 
-            # popularity floor (only for non-Hebrew, and only for mainstream tiers)
             if (min_popularity is not None) and ((track.get("popularity") or 0) < min_popularity):
                 rejects["popularity"] += 1
                 continue
@@ -538,6 +559,7 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
             seen_uris.add(uri)
             seen_artist_title.add(title_key)
             artist_counts[artist_id] = artist_counts.get(artist_id, 0) + 1
+
             if indian_flag:
                 indian_count += 1
 
@@ -545,6 +567,9 @@ def generate_tracks_for_playlist(max_followers, min_followers, playlist_name="")
                 hebrew_tracks.append(uri)
             else:
                 global_tracks.append(uri)
+                if not mainstream_mode:
+                    for w in title_words(title):
+                        title_word_counts[w] = title_word_counts.get(w, 0) + 1
 
             if len(hebrew_tracks) >= hebrew_needed and len(global_tracks) >= global_needed:
                 break
@@ -598,9 +623,8 @@ def process_playlist(user_id: str, name: str, limits: dict, timestamp: str):
     log(f"\n=== START {name} | followers min={min_f} max={max_f} ===")
 
     tracks = generate_tracks_for_playlist(max_f, min_f, playlist_name=name)
-
     if not tracks:
-        log(f"=== END {name} | ERROR: generated 0 tracks. Skipping playlist update. ===")
+        log(f"=== END {name} | ERROR: generated 0 tracks. Skipping update. ===")
         return
 
     pid = find_or_create_playlist(user_id, name)
