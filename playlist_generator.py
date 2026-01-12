@@ -76,7 +76,8 @@ FAMOUS_MIN_TRACK_POPULARITY = 70
 # - Hebrew search uses IL
 # - Global search uses US for diversity
 MARKET_HEBREW = "IL"
-MARKET_GLOBAL = "US"
+# Randomize global market each run (US or GB)
+MARKET_GLOBAL = random.choice(["US", "GB"])
 
 # Rate limiting (conservative)
 MIN_DELAY_SEC = 0.12
